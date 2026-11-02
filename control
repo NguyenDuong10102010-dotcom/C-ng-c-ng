@@ -1,0 +1,10 @@
+Package: com.yourname.videostarauto
+Name: VideoStarAuto
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Auto nhap anh cho Video Star
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
+
