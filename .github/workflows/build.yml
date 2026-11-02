@@ -1,15 +1,22 @@
 name: Build deb
 on: [push, workflow_dispatch]
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v4
+
       - name: Update apt
         run: sudo apt-get update
+
       - uses: Randomblock1/theos-action@v1
+
       - run: make package FINALPACKAGE=1
+
       - uses: actions/upload-artifact@v4
         with:
           name: deb
           path: packages/*.deb
+
