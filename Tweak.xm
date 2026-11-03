@@ -81,23 +81,34 @@ static Class ANAFindClass(NSString *name) {
     return found;
 }
 
+static NSArray *ANAReceivers(id vc) {
+    NSMutableArray *r = [NSMutableArray array];
+    if (vc) [r addObject:vc];
+    UIViewController *v = [vc isKindOfClass:UIViewController.class] ? vc : nil;
+    if (v.navigationController) [r addObject:v.navigationController];
+    if (v.parentViewController) [r addObject:v.parentViewController];
+    if (v.presentingViewController) [r addObject:v.presentingViewController];
+    for (UIViewController *c in v.navigationController.viewControllers ?: @[]) if (![r containsObject:c]) [r addObject:c];
+    return r;
+}
 static id ANAEngine(id vc) {
     SEL s = sel_registerName("getMultiLayerEngine");
-    id e = ANAObj(vc, s);
-    if (!e) e = ANAObj(ANAObj(vc, @selector(navigationController)), s);
-    return e;
+    for (id r in ANAReceivers(vc)) { id e = ANAObj(r, s); if (e) return e; }
+    return nil;
 }
 static NSInteger ANALayerCount(id engine, id vc) {
     SEL s = sel_registerName("numActiveLayers");
     NSInteger n = ANAInt(engine, s);
-    if (n <= 0) n = ANAInt(vc, s);
+    if (n <= 0) for (id r in ANAReceivers(vc)) { n = ANAInt(r, s); if (n > 0) break; }
     if (n < 0) n = 0;
     return MIN(n, 64);
 }
 static id ANALayer(id engine, id vc, NSInteger i) {
     SEL s = sel_registerName("layerAtLayerNum:");
-    if (engine && [engine respondsToSelector:s]) return ((id (*)(id, SEL, NSInteger))objc_msgSend)(engine, s, i);
-    if (vc && [vc respondsToSelector:s]) return ((id (*)(id, SEL, NSInteger))objc_msgSend)(vc, s, i);
+    NSMutableArray *rs = [NSMutableArray array];
+    if (engine) [rs addObject:engine];
+    [rs addObjectsFromArray:ANAReceivers(vc)];
+    for (id r in rs) if ([r respondsToSelector:s]) return ((id (*)(id, SEL, NSInteger))objc_msgSend)(r, s, i);
     return nil;
 }
 // Khoá nhận diện nội dung layer = con trỏ asset + layerImage
@@ -237,7 +248,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
     _status = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 218, 38)];
     _status.numberOfLines = 2; _status.textColor = [UIColor colorWithWhite:0.7 alpha:1];
     _status.font = [UIFont systemFontOfSize:12];
-    _status.text = gEnabled ? @"Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"Đang tắt.";
+    _status.text = gEnabled ? @"[v2] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v2] Đang tắt.";
     [_panel addSubview:_status];
 
     UIView *line = [[UIView alloc] initWithFrame:CGRectMake(16, 94, 218, 1)];
@@ -270,7 +281,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
 - (void)swChanged:(UISwitch *)s {
     gEnabled = s.on;
     [[NSUserDefaults standardUserDefaults] setBool:gEnabled forKey:kEnabledKey];
-    _status.text = gEnabled ? @"Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"Đang tắt.";
+    _status.text = gEnabled ? @"[v2] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v2] Đang tắt.";
 }
 - (void)toggle {
     _open = !_open;
@@ -400,12 +411,12 @@ static void ANAStart(id vc, id resp, NSArray<NSNumber *> *before, NSInteger n) {
     if (!vc || gBusy || !gEnabled) return;
     @try {
         id engine = ANAEngine(vc);
-        if (!engine) { ANALog(@"không lấy được engine"); return; }
+        if (!engine) { ANALog(@"không lấy được engine"); [ANAOverlay setStatus:@"Lỗi: không lấy được engine"]; return; }
         NSArray *after = ANASnapshot(engine, vc, n);
         NSInteger src = -1;
         for (NSInteger i = 0; i < n && i < (NSInteger)after.count && i < (NSInteger)before.count; i++)
             if (![after[i] isEqual:before[i]]) { src = i; break; }
-        if (src < 0) { ANALog(@"không phát hiện layer vừa thay"); return; }
+        if (src < 0) { ANALog(@"không phát hiện layer vừa thay"); [ANAOverlay setStatus:@"Lỗi: không nhận ra layer vừa thay"]; return; }
 
         NSMutableArray *targets = [NSMutableArray array];
         for (NSInteger i = 0; i < n; i++) {
@@ -430,11 +441,13 @@ static void ANAStart(id vc, id resp, NSArray<NSNumber *> *before, NSInteger n) {
 static void ANAHookPicked(id self, SEL _cmd, id resp) {
     NSArray *before = nil; NSInteger n = 0;
     BOOL track = gEnabled && !gReplaying && !gBusy && resp != nil;
+    if (track) [ANAOverlay setStatus:@"Đã bắt được thao tác thay ảnh…"];
     if (track) {
         @try {
             id engine = ANAEngine(self);
             n = ANALayerCount(engine, self);
             if (engine && n > 0) before = ANASnapshot(engine, self, n);
+            else [ANAOverlay setStatus:[NSString stringWithFormat:@"Lỗi: engine=%@ số layer=%ld", engine ? @"có" : @"NIL", (long)n]];
         } @catch (NSException *e) { before = nil; ANALog(@"snapshot exception %@", e); }
     }
     if (gOrigPicked) gOrigPicked(self, _cmd, resp);
@@ -443,18 +456,32 @@ static void ANAHookPicked(id self, SEL _cmd, id resp) {
     ANAAfter(1.0, ^{ ANAStart(wvc, resp, before, n); });
 }
 
+static NSString *gHookInfo = nil;
+
 static BOOL ANAInstallHook(void) {
     if (gOrigPicked) return YES;
-    Class c = ANAFindClass(@"MultiLayerWizEffectVC");
-    if (!c) return NO;
     gPickedSel = sel_registerName("pickedWithClipPickerResponse:");
-    Method m = class_getInstanceMethod(c, gPickedSel);
-    if (!m) { ANALog(@"MultiLayerWizEffectVC không có pickedWithClipPickerResponse:"); return NO; }
+    unsigned n = 0; Class *list = objc_copyClassList(&n);
+    Class best = Nil; NSMutableArray *names = [NSMutableArray array];
+    for (unsigned i = 0; i < n; i++) {
+        Class c = list[i];
+        const char *nm = class_getName(c);
+        if (strncmp(nm, "NS", 2) == 0 || strncmp(nm, "UI", 2) == 0 || strncmp(nm, "_", 1) == 0 && !strstr(nm, "Video_Star")) continue;
+        Method m = class_getInstanceMethod(c, gPickedSel);
+        if (!m) continue;
+        [names addObject:[NSString stringWithUTF8String:nm]];
+        if (!best || (strstr(nm, "MultiLayer") && !strstr(class_getName(best), "MultiLayer"))) best = c;
+    }
+    free(list);
+    ANALog(@"candidates pickedWithClipPickerResponse: %@", names);
+    if (!best) { gHookInfo = @"Hook: KHÔNG thấy hàm pickedWithClipPickerResponse: trong app"; return NO; }
+    Method m = class_getInstanceMethod(best, gPickedSel);
     IMP orig = method_getImplementation(m);
-    if (!class_addMethod(c, gPickedSel, (IMP)ANAHookPicked, method_getTypeEncoding(m)))
+    if (!class_addMethod(best, gPickedSel, (IMP)ANAHookPicked, method_getTypeEncoding(m)))
         method_setImplementation(m, (IMP)ANAHookPicked);
     gOrigPicked = (void (*)(id, SEL, id))orig;
-    ANALog(@"hook installed on %s", class_getName(c));
+    gHookInfo = [NSString stringWithFormat:@"Hook OK: %s", class_getName(best)];
+    ANALog(@"%@", gHookInfo);
     return YES;
 }
 
@@ -463,7 +490,11 @@ static BOOL ANAInstallHook(void) {
 static int gHookTries = 0;
 static void ANATick(void) {
     @try {
-        if (!gOrigPicked && gHookTries < 40) { gHookTries++; ANAInstallHook(); }
+        if (!gOrigPicked && gHookTries < 40) {
+            gHookTries++;
+            BOOL ok = ANAInstallHook();
+            if (ok || gHookTries == 40 || gHookTries == 5) [ANAOverlay setStatus:gHookInfo ?: @"Hook: chưa tìm thấy"];
+        }
         [ANAOverlay ensure];
     } @catch (...) {}
     ANAAfter(2.0, ^{ ANATick(); });
