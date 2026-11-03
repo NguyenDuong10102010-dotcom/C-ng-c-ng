@@ -4,6 +4,15 @@
 // (chỉ layer đang có media, bỏ qua layer trống / 3D / GIF / vẽ / overlay / particles).
 // Log lỗi: Documents/AutoNhapAnh.log
 
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#pragma clang diagnostic ignored "-Wlogical-op-parentheses"
+#pragma clang diagnostic ignored "-Wformat"
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"
+#pragma clang diagnostic ignored "-Wunknown-pragmas"
+
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -63,23 +72,6 @@ static void ANAAfter(double sec, dispatch_block_t b) {
 }
 
 #pragma mark - Tìm class / engine / layer
-
-static Class ANAFindClass(NSString *name) {
-    Class c = NSClassFromString(name);
-    if (c) return c;
-    c = NSClassFromString([@"Video_Star." stringByAppendingString:name]);
-    if (c) return c;
-    const char *want = name.UTF8String; size_t wl = strlen(want);
-    unsigned n = 0; Class *list = objc_copyClassList(&n); Class found = Nil;
-    for (unsigned i = 0; i < n; i++) {
-        const char *nm = class_getName(list[i]); size_t l = strlen(nm);
-        if (l < wl || strcmp(nm + l - wl, want) != 0) continue;
-        if (l > wl) { char p = nm[l - wl - 1]; if (!(p == '.' || (p >= '0' && p <= '9'))) continue; }
-        found = list[i]; break;
-    }
-    free(list);
-    return found;
-}
 
 static NSArray *ANAReceivers(id vc) {
     NSMutableArray *r = [NSMutableArray array];
@@ -174,7 +166,6 @@ static NSString *ANAFold(NSString *s) {
 }
 static NSString *ANAButtonTitle(UIButton *b) {
     NSString *t = [b titleForState:UIControlStateNormal] ?: b.titleLabel.text;
-    if (!t.length) { if (@available(iOS 15.0, *)) t = b.configuration.title; }
     return t;
 }
 static UIButton *ANAFindReplaceButton(UIView **popupOut) {
@@ -466,7 +457,7 @@ static BOOL ANAInstallHook(void) {
     for (unsigned i = 0; i < n; i++) {
         Class c = list[i];
         const char *nm = class_getName(c);
-        if (strncmp(nm, "NS", 2) == 0 || strncmp(nm, "UI", 2) == 0 || strncmp(nm, "_", 1) == 0 && !strstr(nm, "Video_Star")) continue;
+        if (strncmp(nm, "NS", 2) == 0 || strncmp(nm, "UI", 2) == 0 || (strncmp(nm, "_", 1) == 0 && !strstr(nm, "Video_Star"))) continue;
         Method m = class_getInstanceMethod(c, gPickedSel);
         if (!m) continue;
         [names addObject:[NSString stringWithUTF8String:nm]];
