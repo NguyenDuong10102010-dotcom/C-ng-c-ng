@@ -16,6 +16,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
 
 #define CREDIT_TEXT @"Ng Hoang Minh Duong  •  Painuzz"
 static NSString *const kEnabledKey = @"ANA_Enabled_v1";
@@ -239,7 +240,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
     _status = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 218, 38)];
     _status.numberOfLines = 2; _status.textColor = [UIColor colorWithWhite:0.7 alpha:1];
     _status.font = [UIFont systemFontOfSize:12];
-    _status.text = gEnabled ? @"[v2] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v2] Đang tắt.";
+    _status.text = gEnabled ? @"[v3] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v3] Đang tắt.";
     [_panel addSubview:_status];
 
     UIView *line = [[UIView alloc] initWithFrame:CGRectMake(16, 94, 218, 1)];
@@ -272,7 +273,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
 - (void)swChanged:(UISwitch *)s {
     gEnabled = s.on;
     [[NSUserDefaults standardUserDefaults] setBool:gEnabled forKey:kEnabledKey];
-    _status.text = gEnabled ? @"[v2] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v2] Đang tắt.";
+    _status.text = gEnabled ? @"[v3] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v3] Đang tắt.";
 }
 - (void)toggle {
     _open = !_open;
@@ -449,24 +450,42 @@ static void ANAHookPicked(id self, SEL _cmd, id resp) {
 
 static NSString *gHookInfo = nil;
 
+static BOOL ANAClassHasPicked(Class c) {
+    unsigned mc = 0; Method *ml = class_copyMethodList(c, &mc);   // không kích hoạt resolver
+    BOOL has = NO;
+    for (unsigned j = 0; j < mc; j++) if (method_getName(ml[j]) == gPickedSel) { has = YES; break; }
+    if (ml) free(ml);
+    return has;
+}
+
 static BOOL ANAInstallHook(void) {
     if (gOrigPicked) return YES;
     gPickedSel = sel_registerName("pickedWithClipPickerResponse:");
-    unsigned n = 0; Class *list = objc_copyClassList(&n);
-    Class best = Nil; NSMutableArray *names = [NSMutableArray array];
+    Class best = Nil; NSMutableArray *cands = [NSMutableArray array];
+
+    // 1) chỉ quét class nằm trong file chạy chính của app
+    const char *exe = _dyld_get_image_name(0);
+    unsigned n = 0; const char **names = exe ? objc_copyClassNamesForImage(exe, &n) : NULL;
     for (unsigned i = 0; i < n; i++) {
-        Class c = list[i];
-        const char *nm = class_getName(c);
-        if (strncmp(nm, "NS", 2) == 0 || strncmp(nm, "UI", 2) == 0 || (strncmp(nm, "_", 1) == 0 && !strstr(nm, "Video_Star"))) continue;
-        Method m = class_getInstanceMethod(c, gPickedSel);
-        if (!m) continue;
-        [names addObject:[NSString stringWithUTF8String:nm]];
-        if (!best || (strstr(nm, "MultiLayer") && !strstr(class_getName(best), "MultiLayer"))) best = c;
+        Class c = objc_getClass(names[i]);
+        if (!c || !ANAClassHasPicked(c)) continue;
+        [cands addObject:[NSString stringWithUTF8String:names[i]]];
+        if (!best || (strstr(names[i], "MultiLayer") && !strstr(class_getName(best), "MultiLayer"))) best = c;
     }
-    free(list);
-    ANALog(@"candidates pickedWithClipPickerResponse: %@", names);
+    if (names) free(names);
+
+    // 2) dự phòng theo tên
+    if (!best) {
+        for (NSString *nm in @[@"Video_Star.MultiLayerWizEffectVC", @"MultiLayerWizEffectVC"]) {
+            Class c = NSClassFromString(nm);
+            if (c && ANAClassHasPicked(c)) { best = c; [cands addObject:nm]; break; }
+        }
+    }
+    ANALog(@"candidates: %@", cands);
     if (!best) { gHookInfo = @"Hook: KHÔNG thấy hàm pickedWithClipPickerResponse: trong app"; return NO; }
+
     Method m = class_getInstanceMethod(best, gPickedSel);
+    if (!m) { gHookInfo = @"Hook: lỗi lấy method"; return NO; }
     IMP orig = method_getImplementation(m);
     if (!class_addMethod(best, gPickedSel, (IMP)ANAHookPicked, method_getTypeEncoding(m)))
         method_setImplementation(m, (IMP)ANAHookPicked);
@@ -479,12 +498,28 @@ static BOOL ANAInstallHook(void) {
 #pragma mark - Khởi động
 
 static int gHookTries = 0;
+static NSString *ANAGuardPath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [dir stringByAppendingPathComponent:@".ana_guard"];
+}
 static void ANATick(void) {
     @try {
         if (!gOrigPicked && gHookTries < 40) {
-            gHookTries++;
-            BOOL ok = ANAInstallHook();
-            if (ok || gHookTries == 40 || gHookTries == 5) [ANAOverlay setStatus:gHookInfo ?: @"Hook: chưa tìm thấy"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if ([fm fileExistsAtPath:ANAGuardPath()]) {
+                // lần trước crash khi đang cài hook -> bỏ qua 1 lần
+                [fm removeItemAtPath:ANAGuardPath() error:nil];
+                ANALog(@"guard: lần trước crash lúc cài hook, bỏ qua lần này");
+                gHookTries = 40;
+                [ANAOverlay setStatus:@"Chế độ an toàn: lần trước lỗi khi cài hook. Mở lại app để thử lại."];
+            } else {
+                gHookTries++;
+                ANALog(@"install hook try %d", gHookTries);
+                [@"1" writeToFile:ANAGuardPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                BOOL ok = ANAInstallHook();
+                [fm removeItemAtPath:ANAGuardPath() error:nil];
+                if (ok || gHookTries == 40 || gHookTries == 5) [ANAOverlay setStatus:gHookInfo ?: @"Hook: chưa tìm thấy"];
+            }
         }
         [ANAOverlay ensure];
     } @catch (...) {}
