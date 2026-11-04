@@ -240,7 +240,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
     _status = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 218, 38)];
     _status.numberOfLines = 2; _status.textColor = [UIColor colorWithWhite:0.7 alpha:1];
     _status.font = [UIFont systemFontOfSize:12];
-    _status.text = gEnabled ? @"[v3] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v3] Đang tắt.";
+    _status.text = gEnabled ? @"[v4] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v4] Đang tắt.";
     [_panel addSubview:_status];
 
     UIView *line = [[UIView alloc] initWithFrame:CGRectMake(16, 94, 218, 1)];
@@ -273,7 +273,7 @@ static void ANAGlow(CALayer *l, CGFloat r) {
 - (void)swChanged:(UISwitch *)s {
     gEnabled = s.on;
     [[NSUserDefaults standardUserDefaults] setBool:gEnabled forKey:kEnabledKey];
-    _status.text = gEnabled ? @"[v3] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v3] Đang tắt.";
+    _status.text = gEnabled ? @"[v4] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v4] Đang tắt.";
 }
 - (void)toggle {
     _open = !_open;
@@ -428,12 +428,36 @@ static void ANAStart(id vc, id resp, NSArray<NSNumber *> *before, NSInteger n) {
     } @catch (NSException *e) { gBusy = NO; ANALog(@"start exception %@", e); }
 }
 
+#pragma mark - Chẩn đoán cấu trúc ClipPickerResponse (chỉ ghi tên/kiểu, không đọc giá trị)
+
+static void ANADumpClass(Class c) {
+    static NSMutableSet *done; if (!done) done = [NSMutableSet set];
+    NSString *cn = [NSString stringWithUTF8String:class_getName(c)];
+    if ([done containsObject:cn]) return; [done addObject:cn];
+    NSMutableString *o = [NSMutableString stringWithFormat:@"DUMP %@ (super=%s)\n", cn, class_getName(class_getSuperclass(c))];
+    unsigned n = 0;
+    Ivar *iv = class_copyIvarList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  ivar %s  type=%s  off=%td\n", ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i]) ?: "?", ivar_getOffset(iv[i])];
+    if (iv) free(iv);
+    objc_property_t *pr = class_copyPropertyList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  prop %s  attrs=%s\n", property_getName(pr[i]), property_getAttributes(pr[i]) ?: "?"];
+    if (pr) free(pr);
+    Method *ml = class_copyMethodList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  method %s  enc=%s\n", sel_getName(method_getName(ml[i])), method_getTypeEncoding(ml[i]) ?: "?"];
+    if (ml) free(ml);
+    Method *cm = class_copyMethodList(object_getClass(c), &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  classmethod %s  enc=%s\n", sel_getName(method_getName(cm[i])), method_getTypeEncoding(cm[i]) ?: "?"];
+    if (cm) free(cm);
+    ANALog(@"%@", o);
+}
+
 #pragma mark - Hook
 
 static void ANAHookPicked(id self, SEL _cmd, id resp) {
     NSArray *before = nil; NSInteger n = 0;
     BOOL track = gEnabled && !gReplaying && !gBusy && resp != nil;
     if (track) [ANAOverlay setStatus:@"Đã bắt được thao tác thay ảnh…"];
+    if (resp) { @try { ANADumpClass(object_getClass(resp)); } @catch (...) {} }
     if (track) {
         @try {
             id engine = ANAEngine(self);
