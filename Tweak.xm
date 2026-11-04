@@ -1,8 +1,6 @@
-// Auto Nhập Ảnh — VideoStar (com.frontierdesign.videostar)
-// Dylib thuần Objective-C runtime (không cần Theos / MobileSubstrate).
-// Khi bạn thay ảnh ở 1 layer, tool tự điền cùng ảnh đó vào các layer còn lại
-// (chỉ layer đang có media, bỏ qua layer trống / 3D / GIF / vẽ / overlay / particles).
-// Log lỗi: Documents/AutoNhapAnh.log
+// Auto Nhập Ảnh v5 — VideoStar (com.frontierdesign.videostar)
+// Thêm ảnh vào tool -> nhập code xong (hoặc bấm Bắt đầu) -> tool tự thay ảnh vào các layer.
+// Log: Documents/AutoNhapAnh.log  (có nút "Sao chép log" trong panel)
 
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #pragma clang diagnostic ignored "-Wunused-function"
@@ -12,33 +10,40 @@
 #pragma clang diagnostic ignored "-Wformat"
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"
 #pragma clang diagnostic ignored "-Wunknown-pragmas"
+#pragma clang diagnostic ignored "-Wincomplete-implementation"
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
+#import <dlfcn.h>
 
 #define CREDIT_TEXT @"Ng Hoang Minh Duong  •  Painuzz"
+#define ANA_VER @"[v5]"
 static NSString *const kEnabledKey = @"ANA_Enabled_v1";
 
 static BOOL gEnabled = YES;
-static BOOL gReplaying = NO;   // đang tự phát lại ảnh -> không bắt lại hook
-static BOOL gBusy = NO;        // đang chạy 1 job -> không chạy chồng
+static BOOL gReplaying = NO;
+static BOOL gBusy = NO;
 static void (*gOrigPicked)(id, SEL, id) = NULL;
 static SEL gPickedSel;
+static id gTemplate = nil;                         // response mẫu bắt được từ lần thay ảnh thường
+static NSMutableArray<UIImage *> *gImages = nil;   // ảnh người dùng thêm vào tool
 
 #pragma mark - Log
 
 static void ANALog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+static NSString *ANALogPath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return dir ? [dir stringByAppendingPathComponent:@"AutoNhapAnh.log"] : nil;
+}
 static void ANALog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    if (!dir) return;
-    NSString *path = [dir stringByAppendingPathComponent:@"AutoNhapAnh.log"];
+    NSString *path = ANALogPath(); if (!path) return;
     NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    if ([at fileSize] > 200 * 1024) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    if ([at fileSize] > 300 * 1024) [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
     NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], m];
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!h) { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
@@ -46,13 +51,13 @@ static void ANALog(NSString *fmt, ...) {
     [h closeFile];
 }
 
-#pragma mark - Safe messaging helpers (luôn kiểm tra respondsToSelector)
+#pragma mark - Safe messaging helpers
 
 static id ANAObj(id o, SEL s) {
     if (!o || ![o respondsToSelector:s]) return nil;
     return ((id (*)(id, SEL))objc_msgSend)(o, s);
 }
-static void *ANAPtr(id o, SEL s) {           // chỉ lấy con trỏ, không retain
+static void *ANAPtr(id o, SEL s) {
     if (!o || ![o respondsToSelector:s]) return NULL;
     return ((void *(*)(id, SEL))objc_msgSend)(o, s);
 }
@@ -72,7 +77,7 @@ static void ANAAfter(double sec, dispatch_block_t b) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), b);
 }
 
-#pragma mark - Tìm class / engine / layer
+#pragma mark - Engine / layer
 
 static NSArray *ANAReceivers(id vc) {
     NSMutableArray *r = [NSMutableArray array];
@@ -104,7 +109,6 @@ static id ANALayer(id engine, id vc, NSInteger i) {
     for (id r in rs) if ([r respondsToSelector:s]) return ((id (*)(id, SEL, NSInteger))objc_msgSend)(r, s, i);
     return nil;
 }
-// Khoá nhận diện nội dung layer = con trỏ asset + layerImage
 static NSUInteger ANAKey(id layer) {
     if (!layer) return 0;
     NSUInteger a = (NSUInteger)ANAPtr(layer, sel_registerName("asset"));
@@ -131,26 +135,27 @@ static BOOL ANAExcluded(id engine, id vc, id layer, NSInteger i) {
     return NO;
 }
 
-#pragma mark - UI helpers (tìm popup "Replace Content")
+#pragma mark - Windows / view controllers
 
-static NSArray<UIWindow *> *ANAWindows(void) {
+@class ANAPassWindow;
+static ANAPassWindow *gWin = nil;
+
+static NSArray<UIWindow *> *ANAAppWindows(void) {
     NSMutableArray *w = [NSMutableArray array];
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
-        [w addObjectsFromArray:((UIWindowScene *)s).windows];
+        for (UIWindow *x in ((UIWindowScene *)s).windows) if (x != (UIWindow *)gWin) [w addObject:x];
     }
-    if (!w.count) [w addObjectsFromArray:UIApplication.sharedApplication.windows];
+    if (!w.count) for (UIWindow *x in UIApplication.sharedApplication.windows) if (x != (UIWindow *)gWin) [w addObject:x];
     return w;
 }
-static UIWindow *ANAKeyWindow(void) {
-    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
-        if (![s isKindOfClass:UIWindowScene.class]) continue;
-        UIWindowScene *ws = (UIWindowScene *)s;
-        if (ws.activationState != UISceneActivationStateForegroundActive) continue;
-        for (UIWindow *w in ws.windows) if (w.isKeyWindow) return w;
-        if (ws.windows.firstObject) return ws.windows.firstObject;
-    }
-    return UIApplication.sharedApplication.windows.firstObject;
+static UIViewController *ANATopVC(void) {
+    UIWindow *kw = nil;
+    for (UIWindow *w in ANAAppWindows()) { if (w.isKeyWindow) { kw = w; break; } }
+    if (!kw) kw = ANAAppWindows().firstObject;
+    UIViewController *v = kw.rootViewController;
+    while (v.presentedViewController) v = v.presentedViewController;
+    return v;
 }
 static void ANAFindViews(UIView *v, NSString *needle, NSMutableArray *out, int depth) {
     if (depth > 40) return;
@@ -166,39 +171,69 @@ static NSString *ANAFold(NSString *s) {
     return [(s ?: @"") stringByFoldingWithOptions:NSDiacriticInsensitiveSearch | NSCaseInsensitiveSearch locale:nil];
 }
 static NSString *ANAButtonTitle(UIButton *b) {
-    NSString *t = [b titleForState:UIControlStateNormal] ?: b.titleLabel.text;
-    return t;
+    return [b titleForState:UIControlStateNormal] ?: b.titleLabel.text;
 }
 static UIButton *ANAFindReplaceButton(UIView **popupOut) {
-    NSArray *tokens = @[@"replace content", @"thay noi dung", @"replace", @"thay"];
-    for (UIWindow *w in ANAWindows()) {
+    NSArray *tokens = @[@"thay noi dung", @"replace content", @"replace", @"thay"];
+    for (UIWindow *w in ANAAppWindows()) {
         NSMutableArray *popups = [NSMutableArray array];
         ANAFindViews(w, @"CustomPopup", popups, 0);
         for (UIView *p in popups) {
             NSMutableArray *btns = [NSMutableArray array];
             ANAAllButtons(p, btns, 0);
-            for (NSString *tok in tokens) {
+            for (NSString *tok in tokens)
                 for (UIButton *b in btns) {
                     NSString *t = ANAFold(ANAButtonTitle(b));
                     if (t.length && [t rangeOfString:tok].location != NSNotFound) { if (popupOut) *popupOut = p; return b; }
                 }
-            }
         }
     }
     return nil;
 }
+static UIViewController *ANAFindEditorIn(UIViewController *v, int d) {
+    if (!v || d > 10) return nil;
+    if ([NSStringFromClass(v.class) hasSuffix:@"MultiLayerWizEffectVC"] && v.viewIfLoaded.window) return v;
+    NSMutableArray *kids = [NSMutableArray arrayWithArray:v.childViewControllers];
+    if (v.presentedViewController) [kids addObject:v.presentedViewController];
+    if ([v isKindOfClass:UINavigationController.class]) [kids addObjectsFromArray:((UINavigationController *)v).viewControllers];
+    for (UIViewController *c in kids) { UIViewController *r = ANAFindEditorIn(c, d + 1); if (r) return r; }
+    return nil;
+}
+static UIViewController *ANAFindEditor(void) {
+    for (UIWindow *w in ANAAppWindows()) { UIViewController *r = ANAFindEditorIn(w.rootViewController, 0); if (r) return r; }
+    return nil;
+}
 
-#pragma mark - Overlay UI (đen/trắng, phát sáng, thu gọn nhưng luôn hiện)
+#pragma mark - Overlay UI (cửa sổ riêng, không đụng cửa sổ chính)
 
 @interface ANAOverlay : UIView
-@property (nonatomic, strong) UIButton *logo;
+@property (nonatomic, strong) UIButton *logo, *addBtn, *clearBtn, *startBtn, *logBtn;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UISwitch *sw;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic) BOOL open;
 + (instancetype)shared;
 + (void)setStatus:(NSString *)s;
+- (void)refreshCount;
 @end
+
+@interface ANAPassWindow : UIWindow @end
+@implementation ANAPassWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *v = [super hitTest:p withEvent:e];
+    if (v == self || v == self.rootViewController.view) return nil;
+    return v;
+}
+@end
+
+@interface ANARootVC : UIViewController @end
+@implementation ANARootVC
+- (void)loadView { self.view = [[UIView alloc] initWithFrame:UIScreen.mainScreen.bounds]; self.view.backgroundColor = UIColor.clearColor; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+- (BOOL)shouldAutorotate { return YES; }
+@end
+
+static void ANAStartFill(id vc, BOOL useImages, id resp, NSInteger src);
 
 @implementation ANAOverlay
 + (instancetype)shared {
@@ -211,13 +246,24 @@ static UIButton *ANAFindReplaceButton(UIView **popupOut) {
 static void ANAGlow(CALayer *l, CGFloat r) {
     l.shadowColor = UIColor.whiteColor.CGColor; l.shadowOpacity = 0.75; l.shadowRadius = r; l.shadowOffset = CGSizeZero;
 }
-
+- (UIButton *)mkBtn:(NSString *)t frame:(CGRect)f action:(SEL)a filled:(BOOL)filled {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = f; b.layer.cornerRadius = 9; b.layer.borderWidth = 1; b.layer.borderColor = UIColor.whiteColor.CGColor;
+    b.backgroundColor = filled ? UIColor.whiteColor : UIColor.blackColor;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:(filled ? UIColor.blackColor : UIColor.whiteColor) forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:b];
+    return b;
+}
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.backgroundColor = UIColor.clearColor;
 
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 132)];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 250, 232)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.96];
     _panel.layer.cornerRadius = 16; _panel.layer.borderWidth = 1; _panel.layer.borderColor = UIColor.whiteColor.CGColor;
     ANAGlow(_panel.layer, 10);
@@ -237,17 +283,19 @@ static void ANAGlow(CALayer *l, CGFloat r) {
     [_sw addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:_sw];
 
-    _status = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, 218, 38)];
-    _status.numberOfLines = 2; _status.textColor = [UIColor colorWithWhite:0.7 alpha:1];
-    _status.font = [UIFont systemFontOfSize:12];
-    _status.text = gEnabled ? @"[v4] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v4] Đang tắt.";
+    _status = [[UILabel alloc] initWithFrame:CGRectMake(16, 42, 218, 40)];
+    _status.numberOfLines = 3; _status.textColor = [UIColor colorWithWhite:0.72 alpha:1];
+    _status.font = [UIFont systemFontOfSize:11];
+    _status.text = ANA_VER @" Thêm ảnh vào tool, nhập code xong tool tự thay ảnh.";
     [_panel addSubview:_status];
 
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(16, 94, 218, 1)];
-    line.backgroundColor = [UIColor colorWithWhite:1 alpha:0.25];
-    [_panel addSubview:line];
+    _addBtn   = [self mkBtn:@"＋ Thêm ảnh (0)" frame:CGRectMake(16, 88, 130, 32) action:@selector(addPhotos) filled:NO];
+    _clearBtn = [self mkBtn:@"Xóa ảnh"       frame:CGRectMake(152, 88, 82, 32) action:@selector(clearPhotos) filled:NO];
+    _startBtn = [self mkBtn:@"▶  Bắt đầu"    frame:CGRectMake(16, 126, 218, 38) action:@selector(startTap) filled:YES];
+    _logBtn   = [self mkBtn:@"Sao chép log"  frame:CGRectMake(16, 170, 218, 26) action:@selector(copyLog) filled:NO];
+    _logBtn.titleLabel.font = [UIFont systemFontOfSize:11];
 
-    UILabel *cr = [[UILabel alloc] initWithFrame:CGRectMake(8, 100, 234, 20)];
+    UILabel *cr = [[UILabel alloc] initWithFrame:CGRectMake(8, 204, 234, 20)];
     cr.text = CREDIT_TEXT; cr.textAlignment = NSTextAlignmentCenter;
     cr.textColor = [UIColor colorWithWhite:0.85 alpha:1];
     cr.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
@@ -268,17 +316,20 @@ static void ANAGlow(CALayer *l, CGFloat r) {
 }
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
     UIView *v = [super hitTest:p withEvent:e];
-    return v == self ? nil : v;     // chạm xuyên qua phần trống
+    return v == self ? nil : v;
+}
+- (void)refreshCount {
+    [_addBtn setTitle:[NSString stringWithFormat:@"＋ Thêm ảnh (%lu)", (unsigned long)gImages.count] forState:UIControlStateNormal];
 }
 - (void)swChanged:(UISwitch *)s {
     gEnabled = s.on;
     [[NSUserDefaults standardUserDefaults] setBool:gEnabled forKey:kEnabledKey];
-    _status.text = gEnabled ? @"[v4] Đang bật — thay ảnh 1 layer, các layer sau tự điền." : @"[v4] Đang tắt.";
+    _status.text = gEnabled ? ANA_VER @" Đang bật." : ANA_VER @" Đang tắt.";
 }
 - (void)toggle {
     _open = !_open;
     [self layoutPanel];
-    if (_open) _panel.hidden = NO;
+    if (_open) { _panel.hidden = NO; [self refreshCount]; }
     [UIView animateWithDuration:0.2 animations:^{ self.panel.alpha = self.open ? 1 : 0; }
                      completion:^(BOOL f) { if (!self.open) self.panel.hidden = YES; }];
 }
@@ -298,24 +349,150 @@ static void ANAGlow(CALayer *l, CGFloat r) {
     if (y + ps.height > s.height - 8) y = lf.origin.y - ps.height - 8;
     _panel.frame = CGRectMake(x, y, ps.width, ps.height);
 }
-+ (void)ensure {
-    UIWindow *w = ANAKeyWindow(); if (!w) return;
-    ANAOverlay *o = [ANAOverlay shared];
-    if (o.superview != w) { [o removeFromSuperview]; o.frame = w.bounds; [w addSubview:o]; }
-    else [w bringSubviewToFront:o];
+
+// --- chọn ảnh (PHPicker gọi qua runtime, không cần link PhotosUI) ---
+- (void)addPhotos {
+    dlopen("/System/Library/Frameworks/PhotosUI.framework/PhotosUI", RTLD_LAZY);
+    Class cfgC = NSClassFromString(@"PHPickerConfiguration"), pkC = NSClassFromString(@"PHPickerViewController");
+    Class fC = NSClassFromString(@"PHPickerFilter");
+    if (!cfgC || !pkC) { [ANAOverlay setStatus:@"Máy không hỗ trợ chọn nhiều ảnh (cần iOS 14+)."]; return; }
+    @try {
+        id cfg = [[cfgC alloc] init];
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(cfg, sel_registerName("setSelectionLimit:"), 0);
+        id filter = ANAObj(fC, sel_registerName("imagesFilter"));
+        if (filter) ((void (*)(id, SEL, id))objc_msgSend)(cfg, sel_registerName("setFilter:"), filter);
+        id pk = ((id (*)(id, SEL, id))objc_msgSend)([pkC alloc], sel_registerName("initWithConfiguration:"), cfg);
+        ((void (*)(id, SEL, id))objc_msgSend)(pk, sel_registerName("setDelegate:"), self);
+        UIViewController *top = ANATopVC();
+        if (!top) { [ANAOverlay setStatus:@"Không mở được trình chọn ảnh."]; return; }
+        [top presentViewController:pk animated:YES completion:nil];
+    } @catch (NSException *e) { ANALog(@"picker exception %@", e); }
+}
+- (void)picker:(id)picker didFinishPicking:(NSArray *)results {
+    [(UIViewController *)picker dismissViewControllerAnimated:YES completion:nil];
+    NSUInteger cnt = results.count; if (!cnt) return;
+    NSMutableArray *slots = [NSMutableArray array];
+    for (NSUInteger i = 0; i < cnt; i++) [slots addObject:[NSNull null]];
+    __block NSUInteger pending = cnt;
+    for (NSUInteger i = 0; i < cnt; i++) {
+        NSItemProvider *p = ANAObj(results[i], sel_registerName("itemProvider"));
+        if (![p canLoadObjectOfClass:UIImage.class]) { if (--pending == 0) [self commitSlots:slots]; continue; }
+        [p loadObjectOfClass:UIImage.class completionHandler:^(id obj, NSError *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if ([obj isKindOfClass:UIImage.class]) slots[i] = obj;
+                if (--pending == 0) [self commitSlots:slots];
+            });
+        }];
+    }
+}
+- (void)commitSlots:(NSArray *)slots {
+    for (id o in slots) if ([o isKindOfClass:UIImage.class]) [gImages addObject:o];
+    [self refreshCount];
+    _status.text = [NSString stringWithFormat:ANA_VER @" Đã có %lu ảnh. Nhập code xong tool sẽ tự thay, hoặc bấm Bắt đầu.", (unsigned long)gImages.count];
+    ANALog(@"images=%lu", (unsigned long)gImages.count);
+}
+- (void)clearPhotos { [gImages removeAllObjects]; [self refreshCount]; _status.text = ANA_VER @" Đã xóa ảnh."; }
+- (void)copyLog {
+    NSString *t = [NSString stringWithContentsOfFile:ANALogPath() encoding:NSUTF8StringEncoding error:nil] ?: @"(log trống)";
+    if (t.length > 12000) t = [t substringFromIndex:t.length - 12000];
+    UIPasteboard.generalPasteboard.string = t;
+    _status.text = ANA_VER @" Đã sao chép log, dán gửi cho mình.";
+}
+- (void)startTap {
+    if (!gImages.count) { _status.text = ANA_VER @" Chưa có ảnh — bấm Thêm ảnh trước."; return; }
+    UIViewController *vc = ANAFindEditor();
+    if (!vc) { _status.text = ANA_VER @" Không thấy màn hình layer. Mở project nhiều layer trước."; return; }
+    if (gBusy) { _status.text = ANA_VER @" Đang chạy…"; return; }
+    ANAStartFill(vc, YES, nil, -1);
 }
 @end
 
-#pragma mark - Job tự điền ảnh
+static void ANAEnsureWindow(void) {
+    if (gWin && !gWin.hidden && gWin.windowScene) return;
+    UIWindowScene *ws = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) { ws = (UIWindowScene *)s; break; }
+    }
+    if (!ws) return;
+    if (!gWin) {
+        gWin = [[ANAPassWindow alloc] initWithWindowScene:ws];
+        ANARootVC *root = [ANARootVC new];
+        gWin.rootViewController = root;
+        gWin.windowLevel = UIWindowLevelAlert + 50;
+        gWin.backgroundColor = UIColor.clearColor;
+        ANAOverlay *o = [ANAOverlay shared];
+        o.frame = root.view.bounds;
+        [root.view addSubview:o];
+    }
+    gWin.hidden = NO;
+}
+
+#pragma mark - Tạo ClipPickerResponse từ UIImage
+
+static void ANADumpClass(Class c) {
+    static NSMutableSet *done; if (!done) done = [NSMutableSet set];
+    NSString *cn = [NSString stringWithUTF8String:class_getName(c)];
+    if ([done containsObject:cn]) return; [done addObject:cn];
+    NSMutableString *o = [NSMutableString stringWithFormat:@"DUMP %@ (super=%s)\n", cn, class_getName(class_getSuperclass(c))];
+    unsigned n = 0;
+    Ivar *iv = class_copyIvarList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  ivar %s type=%s\n", ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i]) ?: "?"];
+    if (iv) free(iv);
+    objc_property_t *pr = class_copyPropertyList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  prop %s attrs=%s\n", property_getName(pr[i]), property_getAttributes(pr[i]) ?: "?"];
+    if (pr) free(pr);
+    Method *ml = class_copyMethodList(c, &n);
+    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  method %s\n", sel_getName(method_getName(ml[i]))];
+    if (ml) free(ml);
+    ANALog(@"%@", o);
+}
+
+static id ANAMakeResponse(UIImage *img) {
+    if (!gTemplate || !img) return nil;
+    Class rc = object_getClass(gTemplate);
+    SEL initS = sel_registerName("initWithClipPickerResponseType:clipIndex:");
+    id r = nil;
+    @try {
+        id a = [rc alloc];
+        if ([a respondsToSelector:initS]) {
+            NSInteger t = ANAInt(gTemplate, sel_registerName("clipPickerResponseType"));
+            NSInteger ci = ANAInt(gTemplate, sel_registerName("clipIndex"));
+            r = ((id (*)(id, SEL, NSInteger, NSInteger))objc_msgSend)(a, initS, t, ci);
+        } else r = [a init];
+        if (!r) return nil;
+        unsigned n = 0; objc_property_t *pl = class_copyPropertyList(rc, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *name = [NSString stringWithUTF8String:property_getName(pl[i])];
+            NSString *attrs = [NSString stringWithUTF8String:property_getAttributes(pl[i]) ?: ""];
+            id v = nil;
+            if ([attrs containsString:@"UIImage"]) v = img;
+            else if ([attrs containsString:@"NSData"] && [ANAFold(name) containsString:@"image"]) v = UIImageJPEGRepresentation(img, 0.95);
+            else if ([attrs containsString:@"PHAsset"] || [attrs containsString:@"AVAsset"] || [attrs containsString:@"NSURL"]) v = nil;
+            else { @try { v = [gTemplate valueForKey:name]; } @catch (...) { continue; } }
+            @try { [r setValue:v forKey:name]; } @catch (...) {}
+        }
+        if (pl) free(pl);
+    } @catch (NSException *e) { ANALog(@"makeResponse exception %@", e); return nil; }
+    return r;
+}
+
+#pragma mark - Job
 
 @interface ANAJob : NSObject
 @property (nonatomic, weak) id vc;
-@property (nonatomic, strong) id resp;
-@property (nonatomic, strong) id engine;
+@property (nonatomic, strong) id resp, engine;
+@property (nonatomic) BOOL useImages;
+@property (nonatomic, strong) NSArray<UIImage *> *images;
 @property (nonatomic, strong) NSMutableArray<NSNumber *> *targets;
 @property (nonatomic) NSUInteger idx, ok, fail, failStreak;
 @end
 @implementation ANAJob @end
+
+// theo dõi thay đổi để biết "đã nhập code xong"
+static __weak id gPollVC = nil;
+static NSArray *gPollSig = nil, *gRunSig = nil;
+static NSTimeInterval gPollChange = 0;
+static BOOL gPendingDiff = NO;
 
 static void ANAProcess(ANAJob *job);
 
@@ -323,7 +500,14 @@ static void ANAFinish(ANAJob *job, NSString *why) {
     gReplaying = NO; gBusy = NO;
     NSString *msg = why ?: [NSString stringWithFormat:@"Xong: %lu/%lu layer.", (unsigned long)job.ok, (unsigned long)job.targets.count];
     ANALog(@"finish: %@", msg);
-    [ANAOverlay setStatus:msg];
+    [ANAOverlay setStatus:[ANA_VER stringByAppendingFormat:@" %@", msg]];
+    @try {
+        id vc = job.vc;
+        if (vc && job.engine) {
+            NSArray *sig = ANASnapshot(job.engine, vc, ANALayerCount(job.engine, vc));
+            gPollSig = sig; gRunSig = sig; gPendingDiff = NO; gPollChange = 0; gPollVC = vc;
+        }
+    } @catch (...) {}
 }
 
 static void ANAPollPopup(ANAJob *job, NSInteger tries, void (^done)(UIButton *, UIView *)) {
@@ -335,16 +519,23 @@ static void ANAPollPopup(ANAJob *job, NSInteger tries, void (^done)(UIButton *, 
 
 static void ANAProcess(ANAJob *job) {
     id vc = job.vc;
-    if (!vc || !((UIViewController *)vc).view.window) { ANAFinish(job, @"Dừng: màn hình đã đóng."); return; }
+    if (!vc || !((UIViewController *)vc).viewIfLoaded.window) { ANAFinish(job, @"Dừng: màn hình đã đóng."); return; }
     if (job.idx >= job.targets.count) { ANAFinish(job, nil); return; }
-    if (job.failStreak >= 2) { ANAFinish(job, @"Dừng: lỗi liên tiếp, xem AutoNhapAnh.log."); return; }
+    if (job.failStreak >= 2) { ANAFinish(job, @"Dừng: lỗi liên tiếp, bấm Sao chép log."); return; }
 
     NSInteger L = job.targets[job.idx].integerValue;
-    [ANAOverlay setStatus:[NSString stringWithFormat:@"Đang điền layer %ld (%lu/%lu)…", (long)L + 1,
+    [ANAOverlay setStatus:[ANA_VER stringByAppendingFormat:@" Đang điền layer %ld (%lu/%lu)…", (long)L + 1,
                            (unsigned long)job.idx + 1, (unsigned long)job.targets.count]];
     id engine = job.engine;
     id layer = ANALayer(engine, vc, L);
     NSUInteger keyBefore = ANAKey(layer);
+
+    id resp = job.resp;
+    if (job.useImages) {
+        UIImage *img = job.images[job.idx % job.images.count];
+        resp = ANAMakeResponse(img);
+        if (!resp) { ANAFinish(job, @"Không tạo được dữ liệu ảnh. Bấm Sao chép log gửi mình."); return; }
+    }
 
     @try {
         SEL sel = sel_registerName("selectLayer:bordered:");
@@ -362,7 +553,7 @@ static void ANAProcess(ANAJob *job) {
 
         ANAPollPopup(job, 14, ^(UIButton *btn, UIView *popup) {
             if (!btn) {
-                ANALog(@"layer %ld: không thấy popup Replace Content", (long)L);
+                ANALog(@"layer %ld: không thấy popup Thay Nội dung", (long)L);
                 job.fail++; job.failStreak++; job.idx++;
                 ANAAfter(0.5, ^{ ANAProcess(job); });
                 return;
@@ -377,12 +568,11 @@ static void ANAProcess(ANAJob *job) {
                 id vc2 = job.vc;
                 if (!vc2) { ANAFinish(job, @"Dừng: màn hình đã đóng."); return; }
                 gReplaying = YES;
-                @try { if (gOrigPicked) gOrigPicked(vc2, gPickedSel, job.resp); }
+                @try { if (gOrigPicked) gOrigPicked(vc2, gPickedSel, resp); }
                 @catch (NSException *e) { ANALog(@"replay exception %@", e); }
                 ANAAfter(0.3, ^{ gReplaying = NO; });
 
                 ANAAfter(1.2, ^{
-                    // dọn picker còn sót (nếu có)
                     @try {
                         UIViewController *p = ((UIViewController *)vc2).presentedViewController;
                         if (p && [NSStringFromClass(p.class) rangeOfString:@"Picker"].location != NSNotFound)
@@ -399,83 +589,74 @@ static void ANAProcess(ANAJob *job) {
     });
 }
 
-static void ANAStart(id vc, id resp, NSArray<NSNumber *> *before, NSInteger n) {
+static void ANAStartFill(id vc, BOOL useImages, id resp, NSInteger src) {
     if (!vc || gBusy || !gEnabled) return;
     @try {
+        if (useImages && !gTemplate) {
+            [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Lần đầu: hãy thay ảnh 1 layer bằng cách thường (Thay Nội dung → chọn ảnh) để tool học cách thay, rồi bấm Bắt đầu."]];
+            return;
+        }
         id engine = ANAEngine(vc);
-        if (!engine) { ANALog(@"không lấy được engine"); [ANAOverlay setStatus:@"Lỗi: không lấy được engine"]; return; }
-        NSArray *after = ANASnapshot(engine, vc, n);
-        NSInteger src = -1;
-        for (NSInteger i = 0; i < n && i < (NSInteger)after.count && i < (NSInteger)before.count; i++)
-            if (![after[i] isEqual:before[i]]) { src = i; break; }
-        if (src < 0) { ANALog(@"không phát hiện layer vừa thay"); [ANAOverlay setStatus:@"Lỗi: không nhận ra layer vừa thay"]; return; }
-
+        if (!engine) { ANALog(@"không lấy được engine"); [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Lỗi: không lấy được engine"]]; return; }
+        NSInteger n = ANALayerCount(engine, vc);
         NSMutableArray *targets = [NSMutableArray array];
         for (NSInteger i = 0; i < n; i++) {
             if (i == src) continue;
             id layer = ANALayer(engine, vc, i);
-            if (!layer || !ANAKey(layer)) continue;              // layer trống
-            if (ANAExcluded(engine, vc, layer, i)) continue;     // 3D/GIF/vẽ/overlay/particles
+            if (!layer || !ANAKey(layer)) continue;
+            if (ANAExcluded(engine, vc, layer, i)) continue;
             [targets addObject:@(i)];
         }
-        ANALog(@"src=%ld targets=%@", (long)src, targets);
-        if (!targets.count) { [ANAOverlay setStatus:@"Không có layer nào cần điền."]; return; }
+        ANALog(@"fill useImages=%d src=%ld n=%ld targets=%@", useImages, (long)src, (long)n, targets);
+        if (!targets.count) { [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Không có layer nào cần điền."]]; return; }
 
         ANAJob *job = [ANAJob new];
         job.vc = vc; job.resp = resp; job.engine = engine; job.targets = targets;
+        job.useImages = useImages; job.images = [gImages copy];
         gBusy = YES;
         ANAProcess(job);
     } @catch (NSException *e) { gBusy = NO; ANALog(@"start exception %@", e); }
-}
-
-#pragma mark - Chẩn đoán cấu trúc ClipPickerResponse (chỉ ghi tên/kiểu, không đọc giá trị)
-
-static void ANADumpClass(Class c) {
-    static NSMutableSet *done; if (!done) done = [NSMutableSet set];
-    NSString *cn = [NSString stringWithUTF8String:class_getName(c)];
-    if ([done containsObject:cn]) return; [done addObject:cn];
-    NSMutableString *o = [NSMutableString stringWithFormat:@"DUMP %@ (super=%s)\n", cn, class_getName(class_getSuperclass(c))];
-    unsigned n = 0;
-    Ivar *iv = class_copyIvarList(c, &n);
-    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  ivar %s  type=%s  off=%td\n", ivar_getName(iv[i]), ivar_getTypeEncoding(iv[i]) ?: "?", ivar_getOffset(iv[i])];
-    if (iv) free(iv);
-    objc_property_t *pr = class_copyPropertyList(c, &n);
-    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  prop %s  attrs=%s\n", property_getName(pr[i]), property_getAttributes(pr[i]) ?: "?"];
-    if (pr) free(pr);
-    Method *ml = class_copyMethodList(c, &n);
-    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  method %s  enc=%s\n", sel_getName(method_getName(ml[i])), method_getTypeEncoding(ml[i]) ?: "?"];
-    if (ml) free(ml);
-    Method *cm = class_copyMethodList(object_getClass(c), &n);
-    for (unsigned i = 0; i < n; i++) [o appendFormat:@"  classmethod %s  enc=%s\n", sel_getName(method_getName(cm[i])), method_getTypeEncoding(cm[i]) ?: "?"];
-    if (cm) free(cm);
-    ANALog(@"%@", o);
 }
 
 #pragma mark - Hook
 
 static void ANAHookPicked(id self, SEL _cmd, id resp) {
     NSArray *before = nil; NSInteger n = 0;
-    BOOL track = gEnabled && !gReplaying && !gBusy && resp != nil;
-    if (track) [ANAOverlay setStatus:@"Đã bắt được thao tác thay ảnh…"];
-    if (resp) { @try { ANADumpClass(object_getClass(resp)); } @catch (...) {} }
-    if (track) {
+    BOOL fromUser = gEnabled && !gReplaying && !gBusy && resp != nil;
+    if (fromUser) {
+        gTemplate = resp;   // học cách thay ảnh từ lần thay thường của người dùng
+        @try { ANADumpClass(object_getClass(resp)); } @catch (...) {}
+    }
+    BOOL replicate = fromUser && gImages.count == 0;   // chưa thêm ảnh vào tool -> nhân bản ảnh vừa chọn
+    if (replicate) {
+        [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Đã bắt được thao tác thay ảnh…"]];
         @try {
             id engine = ANAEngine(self);
             n = ANALayerCount(engine, self);
             if (engine && n > 0) before = ANASnapshot(engine, self, n);
-            else [ANAOverlay setStatus:[NSString stringWithFormat:@"Lỗi: engine=%@ số layer=%ld", engine ? @"có" : @"NIL", (long)n]];
         } @catch (NSException *e) { before = nil; ANALog(@"snapshot exception %@", e); }
+    } else if (fromUser) {
+        [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Đã học cách thay ảnh. Bấm Bắt đầu hoặc nhập code."]];
     }
     if (gOrigPicked) gOrigPicked(self, _cmd, resp);
-    if (!track || !before || n <= 0) return;
+    if (!replicate || !before || n <= 0) return;
     __weak id wvc = self;
-    ANAAfter(1.0, ^{ ANAStart(wvc, resp, before, n); });
+    ANAAfter(1.0, ^{
+        id vc = wvc; if (!vc || gBusy) return;
+        id engine = ANAEngine(vc); if (!engine) return;
+        NSArray *after = ANASnapshot(engine, vc, n);
+        NSInteger src = -1;
+        for (NSInteger i = 0; i < n && i < (NSInteger)after.count && i < (NSInteger)before.count; i++)
+            if (![after[i] isEqual:before[i]]) { src = i; break; }
+        if (src < 0) { [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Lỗi: không nhận ra layer vừa thay"]]; return; }
+        ANAStartFill(vc, NO, resp, src);
+    });
 }
 
 static NSString *gHookInfo = nil;
 
 static BOOL ANAClassHasPicked(Class c) {
-    unsigned mc = 0; Method *ml = class_copyMethodList(c, &mc);   // không kích hoạt resolver
+    unsigned mc = 0; Method *ml = class_copyMethodList(c, &mc);
     BOOL has = NO;
     for (unsigned j = 0; j < mc; j++) if (method_getName(ml[j]) == gPickedSel) { has = YES; break; }
     if (ml) free(ml);
@@ -486,8 +667,6 @@ static BOOL ANAInstallHook(void) {
     if (gOrigPicked) return YES;
     gPickedSel = sel_registerName("pickedWithClipPickerResponse:");
     Class best = Nil; NSMutableArray *cands = [NSMutableArray array];
-
-    // 1) chỉ quét class nằm trong file chạy chính của app
     const char *exe = _dyld_get_image_name(0);
     unsigned n = 0; const char **names = exe ? objc_copyClassNamesForImage(exe, &n) : NULL;
     for (unsigned i = 0; i < n; i++) {
@@ -497,8 +676,6 @@ static BOOL ANAInstallHook(void) {
         if (!best || (strstr(names[i], "MultiLayer") && !strstr(class_getName(best), "MultiLayer"))) best = c;
     }
     if (names) free(names);
-
-    // 2) dự phòng theo tên
     if (!best) {
         for (NSString *nm in @[@"Video_Star.MultiLayerWizEffectVC", @"MultiLayerWizEffectVC"]) {
             Class c = NSClassFromString(nm);
@@ -507,7 +684,6 @@ static BOOL ANAInstallHook(void) {
     }
     ANALog(@"candidates: %@", cands);
     if (!best) { gHookInfo = @"Hook: KHÔNG thấy hàm pickedWithClipPickerResponse: trong app"; return NO; }
-
     Method m = class_getInstanceMethod(best, gPickedSel);
     if (!m) { gHookInfo = @"Hook: lỗi lấy method"; return NO; }
     IMP orig = method_getImplementation(m);
@@ -519,7 +695,35 @@ static BOOL ANAInstallHook(void) {
     return YES;
 }
 
-#pragma mark - Khởi động
+#pragma mark - Phát hiện "đã nhập code xong" + khởi động
+
+static void ANAPoll(void) {
+    @try {
+        if (gEnabled && !gBusy && gImages.count && gOrigPicked && gTemplate) {
+            UIViewController *vc = ANAFindEditor();
+            if (vc) {
+                id engine = ANAEngine(vc); NSInteger n = ANALayerCount(engine, vc);
+                if (engine && n > 0) {
+                    NSArray *sig = ANASnapshot(engine, vc, n);
+                    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                    if (gPollVC != vc) { gPollVC = vc; gPollSig = sig; gRunSig = sig; gPollChange = 0; gPendingDiff = NO; }
+                    else if (![sig isEqual:gPollSig]) {
+                        NSUInteger diff = 0;
+                        for (NSUInteger i = 0; i < sig.count && i < gPollSig.count; i++) if (![sig[i] isEqual:gPollSig[i]]) diff++;
+                        if (diff >= 2 || sig.count != gPollSig.count) gPendingDiff = YES;
+                        gPollSig = sig; gPollChange = now;
+                    } else if (gPollChange > 0 && now - gPollChange >= 2.0) {
+                        gPollChange = 0;
+                        BOOL go = gPendingDiff && ![sig isEqual:gRunSig];
+                        gPendingDiff = NO;
+                        if (go) { ANALog(@"phát hiện nhập code xong -> tự chạy"); ANAStartFill(vc, YES, nil, -1); }
+                    }
+                }
+            }
+        }
+    } @catch (...) {}
+    ANAAfter(1.0, ^{ ANAPoll(); });
+}
 
 static int gHookTries = 0;
 static NSString *ANAGuardPath(void) {
@@ -531,21 +735,20 @@ static void ANATick(void) {
         if (!gOrigPicked && gHookTries < 40) {
             NSFileManager *fm = [NSFileManager defaultManager];
             if ([fm fileExistsAtPath:ANAGuardPath()]) {
-                // lần trước crash khi đang cài hook -> bỏ qua 1 lần
                 [fm removeItemAtPath:ANAGuardPath() error:nil];
                 ANALog(@"guard: lần trước crash lúc cài hook, bỏ qua lần này");
                 gHookTries = 40;
-                [ANAOverlay setStatus:@"Chế độ an toàn: lần trước lỗi khi cài hook. Mở lại app để thử lại."];
+                [ANAOverlay setStatus:[ANA_VER stringByAppendingString:@" Chế độ an toàn: lần trước lỗi khi cài hook. Mở lại app để thử lại."]];
             } else {
                 gHookTries++;
-                ANALog(@"install hook try %d", gHookTries);
                 [@"1" writeToFile:ANAGuardPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
                 BOOL ok = ANAInstallHook();
                 [fm removeItemAtPath:ANAGuardPath() error:nil];
-                if (ok || gHookTries == 40 || gHookTries == 5) [ANAOverlay setStatus:gHookInfo ?: @"Hook: chưa tìm thấy"];
+                if (ok || gHookTries == 40 || gHookTries == 5)
+                    [ANAOverlay setStatus:[ANA_VER stringByAppendingFormat:@" %@", gHookInfo ?: @"Hook: chưa tìm thấy"]];
             }
         }
-        [ANAOverlay ensure];
+        ANAEnsureWindow();
     } @catch (...) {}
     ANAAfter(2.0, ^{ ANATick(); });
 }
@@ -553,5 +756,7 @@ static void ANATick(void) {
 __attribute__((constructor)) static void ANAInit(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     gEnabled = [d objectForKey:kEnabledKey] ? [d boolForKey:kEnabledKey] : YES;
+    gImages = [NSMutableArray array];
     ANAAfter(1.5, ^{ ANATick(); });
+    ANAAfter(3.0, ^{ ANAPoll(); });
 }
