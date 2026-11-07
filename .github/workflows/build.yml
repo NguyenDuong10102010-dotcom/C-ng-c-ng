@@ -8,24 +8,28 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: theos/theos:latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Theos
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-dir: 'theos'
+          theos-src: 'https://github.com/theos/theos'
+          theos-sdks: 'https://github.com/theos/sdks'
+          theos-sdks-branch: 'master'
+
       - name: Build
         run: |
+          export THEOS=${{ github.workspace }}/theos
+          export PATH=$THEOS/bin:$PATH
           make clean || true
           make package FINALPACKAGE=1
 
-      - name: Show artifacts
-        run: |
-          find .theos packages -maxdepth 5 \( -name '*.dylib' -o -name '*.deb' \) | tee artifacts.txt
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: painuzz-ff
           path: |
             .theos/obj/**/*.dylib
             packages/*.deb
-          if-no-files-found: warn
