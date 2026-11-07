@@ -1,10 +1,9 @@
-Package: com.yourname.videostarauto
-Name: VideoStarAuto
+Package: CheatsFXF
+Name: Painuzz FF
 Version: 1.0.0
 Architecture: iphoneos-arm
-Description: Auto nhap anh cho Video Star
-Maintainer: you
-Author: you
+Description: Free Fire iOS — aimbot head-lock + adjustable FOV, ESP, 3-finger menu toggle. Credit: Painuzz Mobile
+Maintainer: Painuzz Mobile
+Author: Painuzz Mobile
 Section: Tweaks
-Depends: mobilesubstrate
-
+Depends: mobilesubstrate, firmware (>= 14.0)
