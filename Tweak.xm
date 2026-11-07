@@ -1,5 +1,5 @@
 // language: Objective-C, file: Tweak.x
-// Painuzz FF — single-file build. Credit: Painuzz Mobile.
+// Painuzz FF — single-fil build. Credit: Painuzz Mobile.
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
